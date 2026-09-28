@@ -441,6 +441,19 @@ function blacklistSnippet(text,terms){
  if(idx>=0){const a=Math.max(0,idx-100),b=Math.min(text.length,idx+260);return text.slice(a,b).replace(/\s+/g,' ').trim();}
  return lines.slice(0,2).join(' ').slice(0,360);
 }
+function blacklistAllMatches(text, q, terms){
+ const source=String(text||'').replace(/\s+/g,' ').trim();
+ const lower=source.toLowerCase();
+ const qLower=String(q||'').toLowerCase();
+ const needles=lower.includes(qLower)?[qLower]:terms.map(String).filter(Boolean);
+ const found=[];
+ for(const needle of needles){let from=0;while(needle&&from<lower.length){const idx=lower.indexOf(needle,from);if(idx<0)break;found.push({idx,term:needle});from=idx+Math.max(1,needle.length);}}
+ found.sort((a,b)=>a.idx-b.idx||a.term.length-b.term.length);
+ const unique=[];
+ for(const hit of found){if(unique.some(x=>Math.abs(x.idx-hit.idx)<Math.max(1,Math.min(x.term.length,hit.term.length)*0.8)))continue;const a=Math.max(0,hit.idx-120),b=Math.min(source.length,hit.idx+Math.max(260,hit.term.length+180));unique.push({term:hit.term,index:hit.idx,snippet:source.slice(a,b).trim()});}
+ return unique;
+}
+
 app.get('/api/admin/blacklist/files',(req,res)=>{
  if(!adminAuth(req))return res.status(401).json({error:'admin auth'});
  const rows=db.prepare('SELECT id,name,mime,size,created_at,updated_at FROM blacklist_files ORDER BY updated_at DESC').all();
@@ -504,7 +517,7 @@ app.get('/api/public/blacklist/search',(req,res)=>{
    const text=cleanTextFile(decodeStoredFile(f.data),f.mime), lower=text.toLowerCase();
    const all=terms.every(t=>lower.includes(t));
    const phrase=lower.includes(q.toLowerCase());
-   if(all||phrase){results.push({id:f.id,filename:f.name,snippet:blacklistSnippet(text,terms),updatedAt:f.updated_at,matched:terms});}
+   if(all||phrase){const matches=blacklistAllMatches(text,q,terms);results.push({id:f.id,filename:f.name,snippet:matches[0]?.snippet||blacklistSnippet(text,terms),matches,count:matches.length,updatedAt:f.updated_at,matched:terms});}
  }
  res.json({query:q,results});
 });
@@ -514,7 +527,7 @@ app.post('/api/blacklist/search',(req,res)=>{
  const terms=q.toLowerCase().split(/\s+/).filter(Boolean);
  const rows=db.prepare('SELECT id,name,mime,data,updated_at FROM blacklist_files ORDER BY name COLLATE NOCASE').all();
  const results=[];
- for(const f of rows){const text=cleanTextFile(decodeStoredFile(f.data),f.mime),lower=text.toLowerCase();if(terms.every(t=>lower.includes(t))||lower.includes(q.toLowerCase()))results.push({id:f.id,filename:f.name,snippet:blacklistSnippet(text,terms),updatedAt:f.updated_at,matched:terms});}
+ for(const f of rows){const text=cleanTextFile(decodeStoredFile(f.data),f.mime),lower=text.toLowerCase();if(terms.every(t=>lower.includes(t))||lower.includes(q.toLowerCase())){const matches=blacklistAllMatches(text,q,terms);results.push({id:f.id,filename:f.name,snippet:matches[0]?.snippet||blacklistSnippet(text,terms),matches,count:matches.length,updatedAt:f.updated_at,matched:terms});}}
  res.json({query:q,results});
 });
 

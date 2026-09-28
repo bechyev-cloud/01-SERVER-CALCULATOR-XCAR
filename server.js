@@ -450,7 +450,7 @@ function blacklistAllMatches(text, q, terms){
  for(const needle of needles){let from=0;while(needle&&from<lower.length){const idx=lower.indexOf(needle,from);if(idx<0)break;found.push({idx,term:needle});from=idx+Math.max(1,needle.length);}}
  found.sort((a,b)=>a.idx-b.idx||a.term.length-b.term.length);
  const unique=[];
- for(const hit of found){if(unique.some(x=>Math.abs(x.idx-hit.idx)<Math.max(1,Math.min(x.term.length,hit.term.length)*0.8)))continue;const a=Math.max(0,hit.idx-120),b=Math.min(source.length,hit.idx+Math.max(260,hit.term.length+180));unique.push({term:hit.term,index:hit.idx,snippet:source.slice(a,b).trim()});}
+ for(const hit of found){if(unique.some(x=>Math.abs(x.idx-hit.idx)<Math.max(1,Math.min(x.term.length,hit.term.length)*0.8)))continue;const a=hit.idx,b=Math.min(source.length,hit.idx+Math.max(420,hit.term.length+260));unique.push({term:hit.term,index:hit.idx,snippet:source.slice(a,b).trim()});}
  return unique;
 }
 

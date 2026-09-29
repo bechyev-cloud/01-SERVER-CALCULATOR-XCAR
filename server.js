@@ -431,26 +431,108 @@ app.get('/api/admin/restore-settings/users',(req,res)=>{
 function decodeStoredFile(raw){try{return Buffer.from(String(raw||''),'base64').toString('utf8')}catch(e){return String(raw||'')}}
 function cleanTextFile(raw,mime='text/plain'){
  let t=String(raw||'');
- if(/html/i.test(mime)||/\.html?$/i.test('x.'+mime)) t=t.replace(/<script[\s\S]*?<\/script>/gi,' ').replace(/<style[\s\S]*?<\/style>/gi,' ').replace(/<[^>]+>/g,' ');
+ if(/html/i.test(mime)||/\.html?$/i.test('x.'+mime)){
+  t=t.replace(/<script[\s\S]*?<\/script>/gi,' ').replace(/<style[\s\S]*?<\/style>/gi,' ')
+     // важно: границы записей в HTML-файле (строка таблицы, абзац, элемент списка, <br>)
+     // превращаем в ПЕРЕНОС СТРОКИ, а не в пробел — иначе после удаления остальных тегов
+     // все записи склеиваются в одну гигантскую "строку" без \n, и логика поиска конца
+     // фрагмента (по границе строки) не может остановиться и "утекает" через весь файл,
+     // из-за чего совпадение в пользовательском приложении не отображается
+     .replace(/<\s*(br\s*\/?|\/tr|\/p|\/div|\/li|\/h[1-6]|\/td|\/table|\/ul|\/ol)\s*>/gi,'\n')
+     .replace(/<[^>]+>/g,' ');
+ }
  return t.replace(/&nbsp;/gi,' ').replace(/&amp;/gi,'&').replace(/&lt;/gi,'<').replace(/&gt;/gi,'>').replace(/\r/g,'');
 }
-function blacklistSnippet(text,terms){
+const DEFAULT_BLACKLIST_HIGHLIGHT={
+ color:'#7f1d1d',bg:'#fecaca',sizePercent:150,before:0,afterMode:'line',afterChars:200,
+ // текстовые границы и вариант карточки включены по умолчанию, чтобы администратор сразу
+ // видел рабочие настройки (пустые начальный/конечный текст ничего не меняют, пока их не
+ // заполнят — так что включение по умолчанию безопасно). matchPosition по умолчанию "above" —
+ // совпадение показывается аккуратным заголовком над карточкой-предупреждением, а не гигантской
+ // плашкой посреди текста (это и выглядело некрасиво до правки)
+ boundaryMode:'text',startText:'',endText:'',
+ cardVariantEnabled:true,cardVariant:'standard',
+ cardBorderColor:'#e4d9f4',cardBorderWidth:1,cardCorner:'rounded',
+ matchPosition:'above',
+ contextColor:'#7f1d1d',contextBg:''
+};
+function getBlacklistHighlight(){
+ try{
+  const raw=setting('blacklist_highlight','');
+  if(!raw) return {...DEFAULT_BLACKLIST_HIGHLIGHT};
+  const parsed=JSON.parse(raw);
+  return {...DEFAULT_BLACKLIST_HIGHLIGHT,...(parsed&&typeof parsed==='object'?parsed:{})};
+ }catch(e){return {...DEFAULT_BLACKLIST_HIGHLIGHT};}
+}
+// вычисляет границы фрагмента вокруг найденного совпадения (индекс hitIdx в original).
+// Режим "auto" — старое поведение: N символов до совпадения и конец по строке/N символов.
+// Режим "text" — по желанию администратора: фрагмент начинается СРАЗУ ПОСЛЕ указанного
+// "начального текста" (если он найден перед совпадением) и заканчивается СРАЗУ ПОСЛЕ
+// указанного "конечного текста" (если он найден после совпадения). Если начальный/конечный
+// текст не задан или не найден — используется обычное поведение (auto) для этой границы,
+// поэтому границы по тексту можно включать по отдельности.
+function computeSnippetWindow(original,hitIdx,hl){
+ const before=Math.max(0,Number(hl.before)||0);
+ const afterMode=hl.afterMode==='chars'?'chars':'line';
+ const afterChars=Math.max(10,Number(hl.afterChars)||200);
+ let start=Math.max(0,hitIdx-before);
+ let end; { const autoEnd=(afterMode==='chars')?Math.min(original.length,hitIdx+afterChars):(()=>{let e=original.indexOf('\n',hitIdx);return e<0?original.length:e;})(); end=autoEnd; }
+ if(hl.boundaryMode==='text'){
+  const lowerOriginal=original.toLowerCase();
+  if(hl.startText){
+   const needle=String(hl.startText).toLowerCase();
+   const pos=lowerOriginal.lastIndexOf(needle,hitIdx);
+   if(pos>=0) start=pos+String(hl.startText).length;
+  }
+  if(hl.endText){
+   const needle=String(hl.endText).toLowerCase();
+   const pos=lowerOriginal.indexOf(needle,hitIdx);
+   if(pos>=0) end=pos+String(hl.endText).length;
+  }
+ }
+ if(end<start) end=start;
+ return {start,end};
+}
+function blacklistSnippet(text,terms,hl){
  const lines=cleanTextFile(text).split(/\n+/).map(x=>x.trim()).filter(Boolean);
  const lower=text.toLowerCase();
  let idx=-1; for(const term of terms){const i=lower.indexOf(term.toLowerCase()); if(i>=0){idx=i;break;}}
- if(idx>=0){const a=Math.max(0,idx-100),b=Math.min(text.length,idx+260);return text.slice(a,b).replace(/\s+/g,' ').trim();}
+ if(idx>=0){
+  hl=hl||getBlacklistHighlight();
+  // фрагмент по умолчанию начинается ровно с найденного слова (без текста до него, если
+  // "начало отображения" = 0) и заканчивается на конце текущей записи/строки, а не через
+  // фиксированное число символов — иначе фрагмент "утекал" в следующую, никак не связанную
+  // запись базы. Все параметры границ настраиваются администратором (см. computeSnippetWindow).
+  const original=String(text||'').replace(/\r/g,'');
+  const {start,end}=computeSnippetWindow(original,idx,hl);
+  return original.slice(start,end).replace(/\s+/g,' ').trim();
+ }
  return lines.slice(0,2).join(' ').slice(0,360);
 }
-function blacklistAllMatches(text, q, terms){
- const source=String(text||'').replace(/\s+/g,' ').trim();
- const lower=source.toLowerCase();
+function blacklistAllMatches(text, q, terms, hl){
+ // важно: границы записей ищем по ИСХОДНОМУ тексту с переносами строк — каждая запись
+ // чёрного списка обычно занимает одну строку. Склеивать все пробелы/переносы в один пробел
+ // (как было раньше) нельзя — из-за этого фрагмент результата "продолжался" в текст
+ // следующей, совершенно другой записи вместо того чтобы остановиться на своей
+ hl=hl||getBlacklistHighlight();
+ const original=String(text||'').replace(/\r/g,'');
+ const lower=original.toLowerCase();
  const qLower=String(q||'').toLowerCase();
  const needles=lower.includes(qLower)?[qLower]:terms.map(String).filter(Boolean);
  const found=[];
  for(const needle of needles){let from=0;while(needle&&from<lower.length){const idx=lower.indexOf(needle,from);if(idx<0)break;found.push({idx,term:needle});from=idx+Math.max(1,needle.length);}}
  found.sort((a,b)=>a.idx-b.idx||a.term.length-b.term.length);
  const unique=[];
- for(const hit of found){if(unique.some(x=>Math.abs(x.idx-hit.idx)<Math.max(1,Math.min(x.term.length,hit.term.length)*0.8)))continue;const a=hit.idx,b=Math.min(source.length,hit.idx+Math.max(420,hit.term.length+260));unique.push({term:hit.term,index:hit.idx,snippet:source.slice(a,b).trim()});}
+ for(const hit of found){
+  if(unique.some(x=>Math.abs(x.idx-hit.idx)<Math.max(1,Math.min(x.term.length,hit.term.length)*0.8)))continue;
+  // фрагмент по умолчанию начинается ровно со слова совпадения (без текста до него) и
+  // заканчивается на конце этой же строки/записи (не переходя на следующую запись базы);
+  // все параметры границ ("начало"/"конец отображения", текстовые границы) настраиваются
+  // администратором — см. computeSnippetWindow
+  const {start,end}=computeSnippetWindow(original,hit.idx,hl);
+  const snippet=original.slice(start,end).replace(/\s+/g,' ').trim();
+  unique.push({term:hit.term,index:hit.idx,snippet});
+ }
  return unique;
 }
 
@@ -497,6 +579,57 @@ app.post('/api/admin/blacklist/meta',(req,res)=>{
  if(!Number.isFinite(ts)||ts<0)return res.status(400).json({error:'Неверная дата обновления'});
  setSetting('blacklist_update_at',String(Math.floor(ts)));
  res.json({ok:true,lastUpdatedAt:Math.floor(ts),manual:true});
+});
+app.get('/api/admin/blacklist/highlight',(req,res)=>{
+ if(!adminAuth(req))return res.status(401).json({error:'admin auth'});
+ res.json({highlight:getBlacklistHighlight()});
+});
+app.post('/api/admin/blacklist/highlight',(req,res)=>{
+ if(!adminAuth(req))return res.status(401).json({error:'admin auth'});
+ const b=req.body||{};
+ const isHex=v=>/^#[0-9a-fA-F]{3,8}$/.test(String(v||''));
+ const clean={
+  color:isHex(b.color)?b.color:DEFAULT_BLACKLIST_HIGHLIGHT.color,
+  bg:isHex(b.bg)?b.bg:DEFAULT_BLACKLIST_HIGHLIGHT.bg,
+  sizePercent:Math.min(500,Math.max(100,Number(b.sizePercent)||DEFAULT_BLACKLIST_HIGHLIGHT.sizePercent)),
+  before:Math.min(500,Math.max(0,Number(b.before)||0)),
+  afterMode:b.afterMode==='chars'?'chars':'line',
+  afterChars:Math.min(2000,Math.max(10,Number(b.afterChars)||DEFAULT_BLACKLIST_HIGHLIGHT.afterChars)),
+  // текстовые границы фрагмента (по желанию) — включаются отдельным переключателем
+  boundaryMode:b.boundaryMode==='text'?'text':'auto',
+  startText:String(b.startText||'').slice(0,200),
+  endText:String(b.endText||'').slice(0,200),
+  // вариант отображения карточки результата — тоже включается/выключается отдельно
+  cardVariantEnabled:!!b.cardVariantEnabled,
+  cardVariant:['standard','compact','detailed','accent'].includes(b.cardVariant)?b.cardVariant:DEFAULT_BLACKLIST_HIGHLIGHT.cardVariant,
+  // дополнительные настройки карточки: обводка (цвет/толщина), скругление углов,
+  // положение совпадения (в тексте / отдельной строкой над карточкой), цвет и фон
+  // остального (не выделенного) текста — применяются во всех 3 приложениях
+  cardBorderColor:isHex(b.cardBorderColor)?b.cardBorderColor:DEFAULT_BLACKLIST_HIGHLIGHT.cardBorderColor,
+  cardBorderWidth:Math.min(10,Math.max(0,Number.isFinite(Number(b.cardBorderWidth))&&b.cardBorderWidth!==''&&b.cardBorderWidth!==undefined&&b.cardBorderWidth!==null?Number(b.cardBorderWidth):DEFAULT_BLACKLIST_HIGHLIGHT.cardBorderWidth)),
+  cardCorner:b.cardCorner==='sharp'?'sharp':'rounded',
+  matchPosition:b.matchPosition==='above'?'above':'inline',
+  contextColor:(b.contextColor==='')?'':(isHex(b.contextColor)?b.contextColor:DEFAULT_BLACKLIST_HIGHLIGHT.contextColor),
+  contextBg:(b.contextBg==='')?'':(isHex(b.contextBg)?b.contextBg:DEFAULT_BLACKLIST_HIGHLIGHT.contextBg)
+ };
+ setSetting('blacklist_highlight',JSON.stringify(clean));
+ res.json({ok:true,highlight:clean});
+});
+app.get('/api/public/blacklist/highlight',(req,res)=>{
+ res.json({highlight:getBlacklistHighlight()});
+});
+// принудительное обновление всех пользовательских приложений — кнопка в шапке админ-панели.
+// Приложение пользователя периодически опрашивает /api/public/force-update и, увидев более
+// новую метку времени, сама очищает кэш и перезагружается (та же логика, что и при ручном
+// удержании кнопки "Обновить приложение" внутри самого приложения).
+app.post('/api/admin/force-update-users',(req,res)=>{
+ if(!adminAuth(req))return res.status(401).json({error:'admin auth'});
+ const ts=now();
+ setSetting('app_force_update_at',String(ts));
+ res.json({ok:true,ts});
+});
+app.get('/api/public/force-update',(req,res)=>{
+ res.json({ts:Number(setting('app_force_update_at','0'))||0});
 });
 app.get('/api/public/blacklist/meta',(req,res)=>{
  const r=db.prepare('SELECT MAX(updated_at) lastUpdatedAt, COUNT(*) count FROM blacklist_files').get();

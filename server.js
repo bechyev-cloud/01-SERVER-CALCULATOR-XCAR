@@ -6,6 +6,14 @@ const crypto=require('crypto');
 const path=require('path');
 const fs=require('fs');
 const config=require('./config');
+// собственная реализация Web Push (RFC 8291/8292) на встроенном crypto — без npm-пакета
+// web-push, чтобы сервер по-прежнему разворачивался без единой внешней зависимости
+const webpush=require('./webpush');
+// WhatsApp-уведомления клиентам через Green API — см. whatsapp.js. Данные для подключения
+// (idInstance/apiTokenInstance) приходят как обычное поле settings.whatsapp внутри
+// payload через уже существующий /api/sync и хранятся вместе со всем остальным payload
+// пользователя — отдельной таблицы под учётные данные заводить не нужно.
+const whatsapp=require('./whatsapp');
 
 const app=express();
 app.use(cors());
@@ -44,6 +52,17 @@ CREATE TABLE IF NOT EXISTS settings_restore_jobs(
 );
 CREATE TABLE IF NOT EXISTS blacklist_files(
  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, mime TEXT DEFAULT 'text/plain', data TEXT NOT NULL DEFAULT '', size INTEGER DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS push_subscriptions(
+ id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, endpoint TEXT UNIQUE NOT NULL,
+ p256dh TEXT NOT NULL, auth TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+-- дедупликация "напоминаний о следующей оплате" через WhatsApp: один автомобиль в активной
+-- аренде получает не более одного напоминания за календарный день аренды. car_key включает
+-- rentedSince, поэтому у каждой новой аренды той же машины счётчик дней начинается заново.
+CREATE TABLE IF NOT EXISTS whatsapp_reminder_log(
+ user_id INTEGER NOT NULL, car_key TEXT NOT NULL, last_day_index INTEGER NOT NULL DEFAULT 0,
+ sent_at INTEGER NOT NULL, PRIMARY KEY(user_id,car_key)
 );
 `);
 for(const stmt of [
@@ -154,14 +173,96 @@ function scheduleDailyBackup(){
 scheduleDailyBackup();
 
 app.get('/health',(req,res)=>res.json({ok:true,time:now(),server:'XCAR'}));
-// Push API compatibility layer.
-// Push notifications are intentionally disabled in this build so the client never
-// receives 404 errors from the optional push endpoints. Core XCAR functions do not
-// depend on browser push.
-app.get('/api/push/vapid-public-key',(req,res)=>res.status(503).json({ok:false,enabled:false,error:'Push notifications are disabled'}));
-app.post('/api/push/subscribe',(req,res)=>res.status(503).json({ok:false,enabled:false,error:'Push notifications are disabled'}));
-app.post('/api/push/unsubscribe',(req,res)=>res.json({ok:true,enabled:false}));
-app.post('/api/push/notify',(req,res)=>res.json({ok:true,enabled:false,delivered:0}));
+
+// ---------- Web Push (RFC 8291/8292), см. webpush.js — свой VAPID-ключ сервера
+// генерируется один раз и хранится в app_settings; на нём завязана подпись всех
+// push-уведомлений (и адресных "на другом устройстве", и рассылок администратора) ----------
+function getVapidKeys(){
+ let publicKey=setting('vapid_public_key',''), privateKey=setting('vapid_private_key','');
+ if(!publicKey||!privateKey){
+  const k=webpush.generateVapidKeys();
+  publicKey=k.publicKey; privateKey=k.privateKey;
+  setSetting('vapid_public_key',publicKey);
+  setSetting('vapid_private_key',privateKey);
+ }
+ return {publicKey,privateKey};
+}
+const VAPID_SUBJECT=process.env.VAPID_SUBJECT||config.vapidSubject||'mailto:admin@xcar.local';
+// отправляет push на список подписок (строки таблицы push_subscriptions), удаляя из базы
+// те, что браузер/push-сервис считает более не существующими (404/410 — отписка/удаление)
+async function sendPushToSubscriptions(rows,payload){
+ const vapid=getVapidKeys();
+ let sent=0;
+ await Promise.all(rows.map(async(row)=>{
+  try{
+   const result=await webpush.sendWebPush({
+    subscription:{endpoint:row.endpoint,keys:{p256dh:row.p256dh,auth:row.auth}},
+    payload,vapid,subject:VAPID_SUBJECT
+   });
+   if(result.ok) sent++;
+   else if(result.gone) db.prepare('DELETE FROM push_subscriptions WHERE id=?').run(row.id);
+  }catch(e){/* временная сетевая ошибка — оставляем подписку, попробуем в другой раз */}
+ }));
+ return sent;
+}
+// подбирает push-подписки под аудиторию рассылки администратора (та же логика таргетинга,
+// что и у /api/public/broadcasts/for-user) и отправляет им push
+async function broadcastPush(target,selectedIds,payload){
+ let rows;
+ if(target==='all'){
+  rows=db.prepare('SELECT * FROM push_subscriptions').all();
+ }else if(target==='selected'){
+  const ids=(selectedIds||[]).map(Number).filter(Boolean);
+  if(!ids.length) return 0;
+  rows=db.prepare(`SELECT * FROM push_subscriptions WHERE user_id IN (${ids.map(()=>'?').join(',')})`).all(...ids);
+ }else{
+  const t=now();
+  let matchIds;
+  if(target==='active') matchIds=db.prepare('SELECT id FROM users WHERE blocked=0 AND subscription_until>?').all(t).map(x=>x.id);
+  else if(target==='expired') matchIds=db.prepare('SELECT id FROM users WHERE subscription_until<=?').all(t).map(x=>x.id);
+  else if(target==='blocked') matchIds=db.prepare('SELECT id FROM users WHERE blocked=1').all().map(x=>x.id);
+  else matchIds=[];
+  if(!matchIds.length) return 0;
+  rows=db.prepare(`SELECT * FROM push_subscriptions WHERE user_id IN (${matchIds.map(()=>'?').join(',')})`).all(...matchIds);
+ }
+ if(!rows.length) return 0;
+ return sendPushToSubscriptions(rows,payload);
+}
+app.get('/api/push/vapid-public-key',(req,res)=>{
+ res.json({ok:true,enabled:true,publicKey:getVapidKeys().publicKey});
+});
+app.post('/api/push/subscribe',(req,res)=>{
+ const sub=req.body&&req.body.subscription;
+ if(!sub||!sub.endpoint||!sub.keys||!sub.keys.p256dh||!sub.keys.auth)
+  return res.status(400).json({ok:false,error:'Некорректная push-подписка'});
+ // привязка к аккаунту нужна только для адресной рассылки/уведомлений "на другом устройстве";
+ // если логина/пароля нет (или они неверны) — подписка всё равно сохраняется как анонимная
+ // и продолжает получать общие рассылки администратора (target:"all")
+ const u=userAuth(req);
+ const t=now();
+ db.prepare(`INSERT INTO push_subscriptions(user_id,endpoint,p256dh,auth,created_at,updated_at) VALUES(?,?,?,?,?,?)
+   ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,p256dh=excluded.p256dh,auth=excluded.auth,updated_at=excluded.updated_at`)
+  .run(u?u.id:null,sub.endpoint,sub.keys.p256dh,sub.keys.auth,t,t);
+ res.json({ok:true,enabled:true});
+});
+app.post('/api/push/unsubscribe',(req,res)=>{
+ const endpoint=String(req.body?.endpoint||'');
+ if(endpoint) db.prepare('DELETE FROM push_subscriptions WHERE endpoint=?').run(endpoint);
+ res.json({ok:true,enabled:true});
+});
+// уведомляет ДРУГИЕ устройства с тем же аккаунтом (кроме excludeEndpoint — обычно своё
+// собственное устройство) о действии: машина оформлена/возвращена и т.п.
+app.post('/api/push/notify',async(req,res)=>{
+ const u=userAuth(req);
+ if(!u) return res.status(401).json({ok:false,error:'auth'});
+ const title=String(req.body?.title||'XCAR').trim()||'XCAR';
+ const body=String(req.body?.body||'').trim();
+ const excludeEndpoint=String(req.body?.excludeEndpoint||'');
+ if(!body) return res.json({ok:true,enabled:true,delivered:0,sent:0});
+ const rows=db.prepare('SELECT * FROM push_subscriptions WHERE user_id=? AND endpoint<>?').all(u.id,excludeEndpoint);
+ const sent=await sendPushToSubscriptions(rows,{title,body});
+ res.json({ok:true,enabled:true,delivered:rows.length,sent});
+});
 
 
 app.get('/api/public/config',(req,res)=>{
@@ -179,7 +280,10 @@ app.get('/api/public/broadcasts',(req,res)=>{
  res.json({broadcasts:all.map(x=>({id:x.id,title:x.title,message:x.message,created_at:x.created_at,expires_at:x.expires_at,target:x.target}))});
 });
 
-app.get('/api/public/broadcasts/for-user',(req,res)=>{
+// GET — только если клиент передаёт Bearer-токен сессии; POST — тот же обработчик, но
+// позволяет авторизоваться логином/паролем в теле запроса (userAuth поддерживает оба
+// способа), т.к. само приложение пользователя токены сессий нигде не хранит и не использует
+function handleBroadcastsForUser(req,res){
  const u=userAuth(req); if(!u)return res.status(401).json({error:'auth'});
  const t=now();
  const rows=db.prepare(`SELECT * FROM broadcasts WHERE active=1 AND (expires_at=0 OR expires_at>?) ORDER BY id DESC LIMIT 20`).all(t);
@@ -192,7 +296,9 @@ app.get('/api/public/broadcasts/for-user',(req,res)=>{
   return false;
  });
  res.json({broadcasts:filtered.map(x=>({id:x.id,title:x.title,message:x.message,created_at:x.created_at,expires_at:x.expires_at}))});
-});
+}
+app.get('/api/public/broadcasts/for-user',handleBroadcastsForUser);
+app.post('/api/public/broadcasts/for-user',handleBroadcastsForUser);
 
 app.post('/api/register',(req,res)=>{
  const {username,password,email='',phone='',payload={}}=req.body||{};
@@ -234,6 +340,110 @@ app.post('/api/settings-restore/ack',(req,res)=>{
  db.prepare('UPDATE settings_restore_jobs SET applied_at=? WHERE id=? AND user_id=? AND applied_at=0').run(now(),id,u.id);
  res.json({ok:true});
 });
+
+// ---------- WhatsApp-уведомления клиентам (Green API) ----------
+// Конфигурация (idInstance/apiTokenInstance/apiUrl/mediaUrl и переключатели событий)
+// читается прямо из последнего синхронизированного payload пользователя — отдельно
+// её сохранять не нужно, она уже приезжает с каждым /api/sync как payload.settings.whatsapp.
+function userPayloadOf(u){
+ try{ return JSON.parse(u.payload||'{}'); }catch(e){ return {}; }
+}
+function whatsappConfigOf(u){
+ const payload=userPayloadOf(u);
+ const w=(payload.settings&&typeof payload.settings==='object'&&payload.settings.whatsapp)||{};
+ return {
+  enabled:!!w.enabled,
+  idInstance:String(w.idInstance||'').trim(),
+  apiTokenInstance:String(w.apiTokenInstance||'').trim(),
+  apiUrl:String(w.apiUrl||'').trim(),
+  mediaUrl:String(w.mediaUrl||'').trim(),
+  notifyOnCreate:w.notifyOnCreate!==false,
+  notifyOnComplete:w.notifyOnComplete!==false,
+  notifyOnDebtReminder:w.notifyOnDebtReminder!==false,
+  notifyOnDebtAdd:w.notifyOnDebtAdd!==false
+ };
+}
+// Проверка связи с Green API ещё ДО сохранения настроек — пользователь вводит
+// idInstance/apiTokenInstance (и, опционально, свои apiUrl/mediaUrl) и сразу видит,
+// подключён ли инстанс, не отправляя тестовое сообщение.
+app.post('/api/whatsapp/test',async(req,res)=>{
+ const u=userAuth(req);if(!u)return res.status(401).json({error:'auth'});
+ const {idInstance,apiTokenInstance,apiUrl,mediaUrl}=req.body||{};
+ if(!idInstance||!apiTokenInstance) return res.status(400).json({ok:false,error:'Укажите idInstance и apiTokenInstance'});
+ try{
+  const data=await whatsapp.greenApiGetState({idInstance:String(idInstance).trim(),apiTokenInstance:String(apiTokenInstance).trim(),apiUrl,mediaUrl});
+  res.json({ok:true,state:data.stateInstance||'unknown'});
+ }catch(e){
+  res.status(502).json({ok:false,error:e.message||'Не удалось связаться с Green API'});
+ }
+});
+// Единая точка отправки события клиенту (оформление/завершение/оплата) — вызывается
+// приложением сразу в момент действия, с уже готовым текстом сообщения и (опционально)
+// вложением — картинкой/PDF в виде data:URL. Сама отправка всегда идёт с сервера, учётные
+// данные Green API при этом остаются на сервере и не возвращаются клиенту.
+app.post('/api/whatsapp/send',async(req,res)=>{
+ const u=userAuth(req);if(!u)return res.status(401).json({error:'auth'});
+ const {type,phone,message,attachmentDataUrl,attachmentName}=req.body||{};
+ if(!phone) return res.status(400).json({ok:false,error:'Не указан телефон клиента'});
+ const cfg=whatsappConfigOf(u);
+ if(!cfg.enabled) return res.json({ok:false,skipped:'disabled'});
+ if(!cfg.idInstance||!cfg.apiTokenInstance) return res.json({ok:false,skipped:'not_configured'});
+ const eventAllowed=type==='create'?cfg.notifyOnCreate:type==='complete'?cfg.notifyOnComplete:type==='debt'?cfg.notifyOnDebtAdd:true;
+ if(!eventAllowed) return res.json({ok:false,skipped:'event_disabled'});
+ try{
+  let result;
+  if(attachmentDataUrl){
+   const parsed=whatsapp.parseDataUrl(attachmentDataUrl);
+   if(!parsed) return res.status(400).json({ok:false,error:'Повреждённое вложение'});
+   result=await whatsapp.greenApiSendFile({idInstance:cfg.idInstance,apiTokenInstance:cfg.apiTokenInstance,apiUrl:cfg.apiUrl,mediaUrl:cfg.mediaUrl,phone,buffer:parsed.buffer,mime:parsed.mime,fileName:attachmentName||'file',caption:message||''});
+  }else{
+   result=await whatsapp.greenApiSendMessage({idInstance:cfg.idInstance,apiTokenInstance:cfg.apiTokenInstance,apiUrl:cfg.apiUrl,mediaUrl:cfg.mediaUrl,phone,message:message||''});
+  }
+  res.json({ok:true,result});
+ }catch(e){
+  res.status(502).json({ok:false,error:e.message||'Не удалось отправить сообщение'});
+ }
+});
+// Фоновая проверка "напоминаний о следующей оплате": раз в интервал обходит ВСЕХ
+// пользователей с включённым WhatsApp и активной арендой (cars[i].rented), и как только
+// у машины наступает новый календарный день аренды (dayIndex = сколько полных суток
+// прошло с cars[i].rentedSince) — шлёт клиенту одно напоминание на этот день. Срабатывает
+// независимо от того, открыто ли сейчас приложение пользователя — именно поэтому это
+// фоновая задача на сервере, а не в браузере (см. обсуждение при добавлении функции).
+function checkWhatsappReminders(){
+ let rows;
+ try{ rows=db.prepare('SELECT id,payload FROM users WHERE blocked=0').all(); }
+ catch(e){ console.error('whatsapp reminder scan failed',e.message); return; }
+ rows.forEach(u=>{
+  let payload; try{ payload=JSON.parse(u.payload||'{}'); }catch(e){ return; }
+  const w=(payload.settings&&typeof payload.settings==='object'&&payload.settings.whatsapp)||{};
+  if(!w.enabled||w.notifyOnDebtReminder===false||!w.idInstance||!w.apiTokenInstance) return;
+  const cars=Array.isArray(payload.cars)?payload.cars:[];
+  cars.forEach(c=>{
+   if(!c||!c.rented||!c.rentedSince||!c.rentClientPhone) return;
+   const start=new Date(c.rentedSince).getTime();
+   if(!(start>0)) return;
+   const dayIndex=Math.floor((Date.now()-start)/86400000);
+   if(dayIndex<1) return; // новый день аренды ещё не наступил
+   const carKey=String(c.name||'car')+'|'+c.rentedSince;
+   const row=db.prepare('SELECT last_day_index FROM whatsapp_reminder_log WHERE user_id=? AND car_key=?').get(u.id,carKey);
+   if(row&&row.last_day_index>=dayIndex) return;
+   const priceText=c.price?`${Math.round(c.price)} ₽/сутки`:'по тарифу аренды';
+   const message=`Добрый день! Наступил новый день аренды автомобиля «${c.name||''}». Пожалуйста, не забудьте произвести оплату за сутки (${priceText}).`;
+   whatsapp.greenApiSendMessage({idInstance:String(w.idInstance),apiTokenInstance:String(w.apiTokenInstance),apiUrl:w.apiUrl,mediaUrl:w.mediaUrl,phone:c.rentClientPhone,message})
+    .then(()=>{
+     db.prepare('INSERT INTO whatsapp_reminder_log(user_id,car_key,last_day_index,sent_at) VALUES(?,?,?,?) ON CONFLICT(user_id,car_key) DO UPDATE SET last_day_index=excluded.last_day_index,sent_at=excluded.sent_at').run(u.id,carKey,dayIndex,now());
+    })
+    .catch(e=>console.error('whatsapp reminder send failed, user',u.id,e.message));
+  });
+ });
+}
+function scheduleWhatsappReminders(){
+ const INTERVAL_MS=20*60*1000; // раз в 20 минут — новый день аренды не требует более частой проверки
+ setTimeout(checkWhatsappReminders,15000);
+ setInterval(checkWhatsappReminders,INTERVAL_MS);
+}
+scheduleWhatsappReminders();
 
 app.post('/api/subscription/request',(req,res)=>{
  const u=userAuth(req);if(!u)return res.status(401).json({error:'auth'});
@@ -387,6 +597,11 @@ app.post('/api/admin/broadcast',(req,res)=>{
  const expiresAt=Number(b.expiresAt||0);
  const info=db.prepare('INSERT INTO broadcasts(title,message,target,target_user_ids,created_at,expires_at,active) VALUES(?,?,?,?,?,?,1)')
   .run(title,message,target,JSON.stringify(ids),now(),expiresAt);
+ // помимо всплывающего окна в приложении (его клиент подхватывает опросом
+ // /api/public/broadcasts), пытаемся сразу доставить push-уведомление на все устройства,
+ // подписанные на push и попадающие под выбранную аудиторию рассылки; ответ администратору
+ // не задерживаем — доставка происходит в фоне, лучшее из возможного (best-effort)
+ broadcastPush(target,ids,{title,body:message}).catch(()=>{});
  res.json({ok:true,id:info.lastInsertRowid});
 });
 app.get('/api/admin/broadcasts',(req,res)=>{
@@ -646,11 +861,13 @@ app.get('/api/public/blacklist/search',(req,res)=>{
  const terms=q.toLowerCase().split(/\s+/).filter(Boolean);
  const rows=db.prepare('SELECT id,name,mime,data,updated_at FROM blacklist_files ORDER BY name COLLATE NOCASE').all();
  const results=[];
+ // показываем файл только при полном совпадении введённого запроса как единой фразы-подстроки,
+ // а не когда все отдельные слова запроса просто где-то по отдельности встретились в тексте —
+ // иначе в результаты попадали "похожие", но не относящиеся к делу записи
  for(const f of rows){
    const text=cleanTextFile(decodeStoredFile(f.data),f.mime), lower=text.toLowerCase();
-   const all=terms.every(t=>lower.includes(t));
    const phrase=lower.includes(q.toLowerCase());
-   if(all||phrase){const matches=blacklistAllMatches(text,q,terms);results.push({id:f.id,filename:f.name,snippet:matches[0]?.snippet||blacklistSnippet(text,terms),matches,count:matches.length,updatedAt:f.updated_at,matched:terms});}
+   if(phrase){const matches=blacklistAllMatches(text,q,terms);results.push({id:f.id,filename:f.name,snippet:matches[0]?.snippet||blacklistSnippet(text,terms),matches,count:matches.length,updatedAt:f.updated_at,matched:terms});}
  }
  res.json({query:q,results});
 });
@@ -660,7 +877,8 @@ app.post('/api/blacklist/search',(req,res)=>{
  const terms=q.toLowerCase().split(/\s+/).filter(Boolean);
  const rows=db.prepare('SELECT id,name,mime,data,updated_at FROM blacklist_files ORDER BY name COLLATE NOCASE').all();
  const results=[];
- for(const f of rows){const text=cleanTextFile(decodeStoredFile(f.data),f.mime),lower=text.toLowerCase();if(terms.every(t=>lower.includes(t))||lower.includes(q.toLowerCase())){const matches=blacklistAllMatches(text,q,terms);results.push({id:f.id,filename:f.name,snippet:matches[0]?.snippet||blacklistSnippet(text,terms),matches,count:matches.length,updatedAt:f.updated_at,matched:terms});}}
+ // полное совпадение запроса (фраза-подстрока), см. комментарий выше у /api/public/blacklist/search
+ for(const f of rows){const text=cleanTextFile(decodeStoredFile(f.data),f.mime),lower=text.toLowerCase();if(lower.includes(q.toLowerCase())){const matches=blacklistAllMatches(text,q,terms);results.push({id:f.id,filename:f.name,snippet:matches[0]?.snippet||blacklistSnippet(text,terms),matches,count:matches.length,updatedAt:f.updated_at,matched:terms});}}
  res.json({query:q,results});
 });
 

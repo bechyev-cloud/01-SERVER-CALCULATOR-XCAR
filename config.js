@@ -24,5 +24,10 @@ module.exports = {
   payBank: 'Сбербанк',
   payCard: '',
   payRecipient: '',
-  payPhone: ''
+  payPhone: '',
+
+  // Push-уведомления (Web Push, см. webpush.js) — контактный адрес для VAPID JWT
+  // (требование стандарта, push-сервисы вроде Google/Mozilla могут написать на него
+  // при проблемах с рассылкой). Можно не менять.
+  vapidSubject: 'mailto:admin@xcar.local'
 };
